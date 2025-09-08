@@ -11,6 +11,7 @@ import httpx
 
 
 
+
 def detect_lang_heuristic(text: str) -> str:
     # Simple regex-based detection for ingest step
     if re.search(r"[а-яё]", text.lower()):
