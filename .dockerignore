@@ -1,0 +1,12 @@
+.git
+.gitignore
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+temp
+rag_store/*
+!rag_store
+

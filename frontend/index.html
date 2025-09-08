@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RAG FAQ Demo</title>
+    <style>
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; color: #111; }
+      h1 { font-size: 20px; margin: 0 0 12px; }
+      .row { margin-bottom: 12px; }
+      label { display: block; font-weight: 600; margin-bottom: 6px; }
+      textarea { width: 100%; height: 96px; padding: 8px; font-size: 14px; }
+      input[type=number], input[type=text] { padding: 6px 8px; font-size: 14px; }
+      button { padding: 8px 12px; font-size: 14px; cursor: pointer; }
+      .muted { color: #666; font-size: 12px; }
+      .answer { padding: 12px; background: #f6f8fa; border-radius: 6px; white-space: pre-wrap; margin-bottom: 12px; }
+      .retrieved { border-collapse: collapse; width: 100%; }
+      .retrieved th, .retrieved td { text-align: left; border-bottom: 1px solid #eee; padding: 6px 8px; }
+      .status { margin-top: 8px; }
+      .endpoint { display: flex; gap: 8px; align-items: center; }
+      .endpoint input { flex: 1; }
+      .small { font-size: 12px; }
+      .flex { display: flex; gap: 16px; align-items: center; }
+    </style>
+  </head>
+  <body>
+    <h1>RAG FAQ Demo</h1>
+
+    <div class="row">
+      <div class="endpoint">
+        <label for="apiUrl">API Endpoint</label>
+        <input id="apiUrl" type="text" value="http://localhost:11435/ask" />
+        <button id="saveUrl">Save</button>
+      </div>
+      <div class="muted small">Change if your API is on a different host/port.</div>
+    </div>
+
+    <div class="row">
+      <label for="query">Query</label>
+      <textarea id="query">Могу ли я как нибудь отменить перевод на другую карту?</textarea>
+    </div>
+
+    <div class="row flex">
+      <div>
+        <label for="k">Top-k</label>
+        <input id="k" type="number" value="3" min="1" max="10" />
+      </div>
+      <div>
+        <label for="lang">Lang (optional)</label>
+        <input id="lang" type="text" placeholder="auto (ru/uz)" />
+      </div>
+    </div>
+
+    <div class="row">
+      <button id="askBtn">Ask</button>
+      <button id="exampleBtn" class="small">Run Example</button>
+      <span id="status" class="status muted"></span>
+    </div>
+
+    <div class="row">
+      <div><strong>Answer</strong></div>
+      <div id="answer" class="answer"></div>
+    </div>
+
+    <div class="row">
+      <div class="flex" style="flex-wrap: wrap; gap: 8px; align-items: center;">
+        <strong>Suggestions</strong>
+        <div id="sugs" class="small" style="display:flex; gap:8px; flex-wrap:wrap;"></div>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="flex" style="justify-content: space-between;">
+        <strong>Retrieved</strong>
+        <span class="muted small" id="count"></span>
+      </div>
+      <table class="retrieved" id="retrievedTable">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Score</th>
+            <th>Lang</th>
+            <th>Source</th>
+            <th>Question</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <div class="row">
+      <details>
+        <summary>Raw JSON</summary>
+        <pre id="raw" style="background:#f6f8fa; padding:12px; border-radius:6px; overflow:auto;"></pre>
+      </details>
+    </div>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+
+      // Load saved endpoint
+      const savedUrl = localStorage.getItem('RAG_API_URL');
+      if (savedUrl) { $("apiUrl").value = savedUrl; }
+
+      $("saveUrl").addEventListener('click', () => {
+        localStorage.setItem('RAG_API_URL', $("apiUrl").value.trim());
+        $("status").textContent = 'Saved endpoint.';
+        setTimeout(() => $("status").textContent = '', 1500);
+      });
+
+      $("exampleBtn").addEventListener('click', async () => {
+        $("query").value = "Могу ли я как нибудь отменить перевод на другую карту?";
+        $("k").value = 3;
+        $("lang").value = '';
+        await ask();
+      });
+
+      $("askBtn").addEventListener('click', ask);
+
+      async function ask() {
+        const apiUrl = $("apiUrl").value.trim() || 'http://localhost:11435/ask';
+        const payload = {
+          query: $("query").value.trim(),
+          k: Math.max(1, parseInt($("k").value, 10) || 3),
+        };
+        const lang = $("lang").value.trim();
+        if (lang) payload.lang = lang;
+
+        $("status").textContent = 'Querying…';
+        $("answer").textContent = '';
+        $("retrievedTable").querySelector('tbody').innerHTML = '';
+        $("raw").textContent = '';
+        $("count").textContent = '';
+
+        try {
+          const resp = await fetch(apiUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          });
+
+          if (!resp.ok) {
+            const txt = await resp.text();
+            throw new Error(`HTTP ${resp.status}: ${txt}`);
+          }
+          const data = await resp.json();
+          render(data);
+          $("status").textContent = 'Done';
+          setTimeout(() => $("status").textContent = '', 1500);
+        } catch (err) {
+          $("status").textContent = 'Error';
+          $("answer").textContent = String(err);
+        }
+      }
+
+      function render(data) {
+        $("answer").textContent = data.answer || '';
+        const items = Array.isArray(data.retrieved) ? data.retrieved : [];
+        $("count").textContent = items.length ? `${items.length} items` : '';
+
+        // Suggestions
+        const sugs = Array.isArray(data.suggestions) ? data.suggestions.slice(0, 6) : [];
+        const sugsEl = $("sugs");
+        sugsEl.innerHTML = '';
+        sugs.forEach((text) => {
+          const btn = document.createElement('button');
+          btn.textContent = text;
+          btn.className = 'small';
+          btn.addEventListener('click', async () => {
+            $("query").value = text;
+            await ask();
+          });
+          sugsEl.appendChild(btn);
+        });
+
+        const tbody = $("retrievedTable").querySelector('tbody');
+        items.forEach((it, i) => {
+          const tr = document.createElement('tr');
+          tr.innerHTML = `
+            <td>${i+1}</td>
+            <td>${(it.score ?? '').toString().slice(0, 8)}</td>
+            <td>${it.lang ?? ''}</td>
+            <td>${it.source ?? ''}</td>
+            <td>${it.question ?? ''}</td>
+          `;
+          tbody.appendChild(tr);
+        });
+
+        $("raw").textContent = JSON.stringify(data, null, 2);
+      }
+    </script>
+  </body>
+  </html>

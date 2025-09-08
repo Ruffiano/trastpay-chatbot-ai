@@ -1,0 +1,53 @@
+version: "3.9"
+
+services:
+  rag-api:
+    build: .
+    container_name: rag_api
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # MySQL connection (defaults work out of the box)
+      DB_HOST: ${DB_HOST:-db}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_NAME: ${DB_NAME:-rag}
+      DB_USER: ${DB_USER:-rag}
+      DB_PASSWORD: ${DB_PASSWORD:-ragpw}
+    volumes:
+      # Persist FAISS index and HF model cache between restarts
+      - rag_store:/app/rag_store
+      - hf_cache:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: mysql:8.0
+    container_name: rag_db
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpw}
+      MYSQL_DATABASE: ${DB_NAME:-rag}
+      MYSQL_USER: ${DB_USER:-rag}
+      MYSQL_PASSWORD: ${DB_PASSWORD:-ragpw}
+    ports:
+      - "3306:3306"
+    volumes:
+      - db_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-p${MYSQL_ROOT_PASSWORD:-rootpw}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  rag_store: {}
+  hf_cache: {}
+  db_data: {}

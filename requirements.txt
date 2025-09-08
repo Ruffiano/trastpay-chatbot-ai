@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+faiss-cpu
+sentence-transformers
+httpx
+pydantic==2.*
+langdetect
+SQLAlchemy>=2.0
+PyMySQL
+cryptography
