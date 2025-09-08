@@ -18,12 +18,16 @@ from fastapi.middleware.cors import CORSMiddleware
 
 # -------- Config ---------
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "http://localhost:8000/v1")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("NVIDIA_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-oss-20b")
 
 STORE_DIR = "rag_store"
 INDEX_PATH = os.path.join(STORE_DIR, "index.faiss")
 META_PATH = os.path.join(STORE_DIR, "meta.jsonl")
+
+# Embeddings config
+EMBEDDING_BACKEND = os.getenv("EMBEDDING_BACKEND", "local").lower()  # 'local' or 'api'
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nvidia/bge-m3")
 
 # DB config (MySQL)
 DB_HOST = os.getenv("DB_HOST", "db")
@@ -166,13 +170,49 @@ def get_embed_model() -> SentenceTransformer:
     global _embed_model
     if _embed_model is None:
         # Lazy-load the embedding model to avoid slow API startup
-        _embed_model = SentenceTransformer("BAAI/bge-m3")
+        _embed_model = SentenceTransformer(EMBEDDING_MODEL)
     return _embed_model
 
 
-def embed_query(text: str) -> np.ndarray:
+async def embed_query(text: str) -> np.ndarray:
+    # API backend (OpenAI-compatible /embeddings)
+    if EMBEDDING_BACKEND == "api":
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if OPENAI_API_KEY:
+            headers["Authorization"] = f"Bearer {OPENAI_API_KEY}"
+        base_body: Dict[str, Any] = {"model": EMBEDDING_MODEL, "input": [text]}
+        alt_body: Dict[str, Any] = {"model": EMBEDDING_MODEL, "input": text}
+        if "api.nvidia.com" in OPENAI_BASE_URL:
+            # NVIDIA specifics: top-level encoding_format and truncate
+            for b in (base_body, alt_body):
+                b["encoding_format"] = "float"
+                b["truncate"] = "NONE"
+            alt_body["input_type"] = "query"
+        url = f"{OPENAI_BASE_URL.rstrip('/')}/embeddings"
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                # Attempt 1
+                resp = await client.post(url, headers=headers, json=base_body)
+                if resp.status_code >= 400:
+                    # Attempt 2 with alternative body shape
+                    resp2 = await client.post(url, headers=headers, json=alt_body)
+                    resp2.raise_for_status()
+                    data = resp2.json()
+                else:
+                    data = resp.json()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Embedding upstream error: {e}")
+
+        try:
+            emb = data["data"][0]["embedding"]
+        except Exception:
+            raise HTTPException(status_code=500, detail="Invalid embeddings response")
+        vec = np.asarray([emb], dtype=np.float32)
+        return l2_normalize(vec)
+
+    # Local backend (SentenceTransformers)
     model = get_embed_model()
-    vec = model.encode([text], show_progress_bar=False)
+    vec = await anyio.to_thread.run_sync(lambda: model.encode([text], show_progress_bar=False))
     if isinstance(vec, list):
         vec = np.array(vec)
     vec = vec.astype(np.float32)
@@ -283,7 +323,7 @@ async def ask(req: AskRequest):
     # FAISS search
     k = max(1, int(req.k))
     k = min(k, len(_metas))
-    qvec = embed_query(req.query)
+    qvec = await embed_query(req.query)
     D, I = _faiss_index.search(qvec, k)  # type: ignore
     scores = D[0].tolist() if len(D) else []
     idxs = I[0].tolist() if len(I) else []
@@ -485,7 +525,7 @@ async def chat_send(req: ChatSendRequest) -> ChatSendResponse:
     # Retrieve context based on the latest user message
     k = max(1, int(req.k))
     k = min(k, len(_metas))
-    qvec = embed_query(user_text)
+    qvec = await embed_query(user_text)
     D, I = _faiss_index.search(qvec, k)  # type: ignore
     scores = D[0].tolist() if len(D) else []
     idxs = I[0].tolist() if len(I) else []

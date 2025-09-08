@@ -7,6 +7,7 @@ from typing import List, Dict, Any
 import faiss  # type: ignore
 import numpy as np
 from sentence_transformers import SentenceTransformer
+import httpx
 
 
 
@@ -35,14 +36,25 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Ingest harmony.jsonl into FAISS RAG store")
     parser.add_argument("--input", required=True, help="Path to harmony.jsonl")
     parser.add_argument("--out", required=True, help="Output directory (e.g., rag_store)")
+    parser.add_argument("--backend", default=os.getenv("EMBEDDING_BACKEND", "local"), choices=["local", "api"], help="Embedding backend: local or api")
+    parser.add_argument("--model", default=os.getenv("EMBEDDING_MODEL", "nvidia/bge-m3"), help="Embedding model id")
+    parser.add_argument("--batch", type=int, default=int(os.getenv("EMBEDDING_BATCH", "64")), help="Embedding batch size")
     args = parser.parse_args()
 
     input_path = args.input
     out_dir = args.out
     os.makedirs(out_dir, exist_ok=True)
 
-    # Load model once
-    model = SentenceTransformer("BAAI/bge-m3")
+    backend = args.backend.lower()
+    model_id = args.model
+    batch_size = max(1, int(args.batch))
+    openai_base = os.getenv("OPENAI_BASE_URL", "http://localhost:8000/v1").rstrip("/")
+    openai_key = os.getenv("OPENAI_API_KEY") or os.getenv("NVIDIA_API_KEY")
+
+    # Load local model if needed
+    model: Optional[SentenceTransformer] = None
+    if backend == "local":
+        model = SentenceTransformer(model_id)
 
     texts: List[str] = []
     metas: List[Dict[str, Any]] = []
@@ -98,11 +110,42 @@ def main() -> None:
         return
 
     # Encode and normalize
-    embeddings = model.encode(texts, batch_size=64, show_progress_bar=False)
-    if isinstance(embeddings, list):
-        embeddings = np.array(embeddings)
-    embeddings = embeddings.astype(np.float32)
-    embeddings = l2_normalize(embeddings)
+    if backend == "local":
+        embeddings = model.encode(texts, batch_size=batch_size, show_progress_bar=False)  # type: ignore[union-attr]
+        if isinstance(embeddings, list):
+            embeddings = np.array(embeddings)
+        embeddings = embeddings.astype(np.float32)
+        embeddings = l2_normalize(embeddings)
+    else:
+        headers = {"Content-Type": "application/json"}
+        if openai_key:
+            headers["Authorization"] = f"Bearer {openai_key}"
+        all_vecs: List[List[float]] = []
+        with httpx.Client(timeout=60.0) as client:
+            for i in range(0, len(texts), batch_size):
+                chunk = texts[i:i+batch_size]
+                base_body: Dict[str, Any] = {"model": model_id, "input": chunk}
+                alt_body: Dict[str, Any] = {"model": model_id, "input": chunk}
+                if "api.nvidia.com" in openai_base:
+                    for b in (base_body, alt_body):
+                        b["encoding_format"] = "float"
+                        b["truncate"] = "NONE"
+                    alt_body["input_type"] = "passage"
+                url = f"{openai_base}/embeddings"
+                resp = client.post(url, headers=headers, json=base_body)
+                if resp.status_code >= 400:
+                    resp2 = client.post(url, headers=headers, json=alt_body)
+                    resp2.raise_for_status()
+                    data = resp2.json()
+                else:
+                    data = resp.json()
+                try:
+                    for item in data["data"]:
+                        all_vecs.append(item["embedding"])
+                except Exception:
+                    raise RuntimeError("Invalid embeddings response from API")
+        embeddings = np.asarray(all_vecs, dtype=np.float32)
+        embeddings = l2_normalize(embeddings)
 
     # Build FAISS index (IP similarity on normalized vectors == cosine similarity)
     index = build_index(embeddings)
@@ -120,4 +163,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
