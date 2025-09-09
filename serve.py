@@ -75,6 +75,7 @@ sessions_table = Table(
     metadata,
     Column("id", String(64), primary_key=True),
     Column("created_at", DateTime, server_default=func.now(), nullable=False),
+    Column("status", String(16), nullable=False, default="active"),
 )
 
 messages_table = Table(
@@ -140,6 +141,24 @@ def _db_clear_session(session_id: str) -> None:
         conn.execute(delete(sessions_table).where(sessions_table.c.id == session_id))
 
 
+def _db_close_session(session_id: str) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            sessions_table.update()
+            .where(sessions_table.c.id == session_id)
+            .values(status="closed")
+        )
+
+
+def _db_get_session_status(session_id: str) -> Optional[str]:
+    with engine.begin() as conn:
+        result = conn.execute(
+            select(sessions_table.c.status)
+            .where(sessions_table.c.id == session_id)
+        ).first()
+    return result.status if result else None
+
+
 def detect_query_language(text: str) -> str:
     # Heuristic first
     if re.search(r"[а-яё]", text.lower()):
@@ -159,6 +178,16 @@ def detect_query_language(text: str) -> str:
         pass
     # Default to Uzbek policy if unsure
     return "uz"
+
+
+def get_greeting_message(lang: str) -> str:
+    """Get greeting message based on language code."""
+    greetings = {
+        "uz": "Salom! Men Trastpay yordamchingizman. Bugun sizga qanday yordam bera olishim mumkin?",
+        "ru": "Здравствуйте! Я ваш помощник Trastpay. Чем могу помочь вам сегодня?",
+        "en": "Hello! I'm your Trastpay assistant. How can I assist you today?"
+    }
+    return greetings.get(lang, greetings["uz"])  # Default to Uzbek
 
 
 def l2_normalize(x: np.ndarray) -> np.ndarray:
@@ -249,8 +278,13 @@ class AskResponse(BaseModel):
     suggestions: List[str] = []
 
 
+class ChatStartRequest(BaseModel):
+    lang: str = Field(default="uz", description="Language code: uz, ru, or en")
+
+
 class ChatStartResponse(BaseModel):
     session_id: str
+    greeting: str
 
 
 class ChatMessage(BaseModel):
@@ -432,12 +466,13 @@ def health() -> Dict[str, str]:
     "/chat/start",
     tags=["Chat"],
     summary="Start a new chat session",
-    description="Creates and returns a new session_id. You can also omit session_id in POST /chat/send to auto-create one.",
+    description="Creates and returns a new session_id with a greeting message in the specified language. You can also omit session_id in POST /chat/send to auto-create one.",
     response_model=ChatStartResponse,
 )
-def chat_start() -> ChatStartResponse:
+def chat_start(req: ChatStartRequest) -> ChatStartResponse:
     sid = _db_create_session()
-    return ChatStartResponse(session_id=sid)
+    greeting = get_greeting_message(req.lang)
+    return ChatStartResponse(session_id=sid, greeting=greeting)
 
 
 @app.post(
@@ -500,6 +535,15 @@ async def chat_send(req: ChatSendRequest) -> ChatSendResponse:
 
     # Create or retrieve session
     sid = req.session_id or await anyio.to_thread.run_sync(_db_create_session)
+    
+    # Check if session exists and is active
+    if req.session_id:
+        session_status = await anyio.to_thread.run_sync(_db_get_session_status, sid)
+        if not session_status:
+            raise HTTPException(status_code=404, detail="Session not found")
+        if session_status == "closed":
+            raise HTTPException(status_code=400, detail="Session is closed. Please start a new chat.")
+    
     history = await anyio.to_thread.run_sync(_db_get_history, sid, 100)
 
     # Append user message to history
@@ -633,6 +677,18 @@ async def chat_send(req: ChatSendRequest) -> ChatSendResponse:
 def chat_history(session_id: str) -> ChatHistoryResponse:
     hist = _db_get_history(session_id, 200)
     return ChatHistoryResponse(session_id=session_id, history=[ChatMessage(**m) for m in hist[-50:]])
+
+
+@app.post("/chat/{session_id}/close", tags=["Chat"], summary="Close chat session")
+def chat_close(session_id: str) -> Dict[str, str]:
+    session_status = _db_get_session_status(session_id)
+    if not session_status:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if session_status == "closed":
+        raise HTTPException(status_code=400, detail="Session already closed")
+    
+    _db_close_session(session_id)
+    return {"status": "closed", "session_id": session_id}
 
 
 @app.delete("/chat/{session_id}", tags=["Chat"], summary="Reset chat session")

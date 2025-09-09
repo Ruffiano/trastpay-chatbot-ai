@@ -11,6 +11,7 @@
       label { display: block; font-weight: 600; margin-bottom: 6px; }
       textarea { width: 100%; height: 96px; padding: 8px; font-size: 14px; }
       input[type=number], input[type=text] { padding: 6px 8px; font-size: 14px; }
+      select { padding: 6px 8px; font-size: 14px; }
       button { padding: 8px 12px; font-size: 14px; cursor: pointer; }
       .muted { color: #666; font-size: 12px; }
       .answer { padding: 12px; background: #f6f8fa; border-radius: 6px; white-space: pre-wrap; margin-bottom: 12px; }
@@ -29,10 +30,28 @@
     <div class="row">
       <div class="endpoint">
         <label for="apiUrl">API Endpoint</label>
-        <input id="apiUrl" type="text" value="http://localhost:11435/ask" />
+        <input id="apiUrl" type="text" value="http://localhost:8000" />
         <button id="saveUrl">Save</button>
       </div>
       <div class="muted small">Change if your API is on a different host/port.</div>
+    </div>
+
+    <div class="row">
+      <div class="flex">
+        <div>
+          <label for="lang">Language</label>
+          <select id="lang">
+            <option value="uz">Uzbek (O'zbek)</option>
+            <option value="ru">Russian (Русский)</option>
+            <option value="en">English</option>
+          </select>
+        </div>
+        <div>
+          <button id="startChatBtn">Start New Chat</button>
+          <button id="closeChatBtn" disabled>Close Session</button>
+          <span id="chatStatus" class="status muted"></span>
+        </div>
+      </div>
     </div>
 
     <div class="row">
@@ -70,6 +89,11 @@
     </div>
 
     <div class="row">
+      <div><strong>Chat History</strong></div>
+      <div id="chatHistory" class="answer" style="max-height: 300px; overflow-y: auto;"></div>
+    </div>
+
+    <div class="row">
       <div class="flex" style="justify-content: space-between;">
         <strong>Retrieved</strong>
         <span class="muted small" id="count"></span>
@@ -97,6 +121,7 @@
 
     <script>
       const $ = (id) => document.getElementById(id);
+      let currentSessionId = null;
 
       // Load saved endpoint
       const savedUrl = localStorage.getItem('RAG_API_URL');
@@ -108,23 +133,86 @@
         setTimeout(() => $("status").textContent = '', 1500);
       });
 
+      $("startChatBtn").addEventListener('click', startNewChat);
+      $("closeChatBtn").addEventListener('click', closeChat);
+
       $("exampleBtn").addEventListener('click', async () => {
         $("query").value = "Могу ли я как нибудь отменить перевод на другую карту?";
         $("k").value = 3;
-        $("lang").value = '';
         await ask();
       });
 
       $("askBtn").addEventListener('click', ask);
 
+      async function startNewChat() {
+        const apiUrl = $("apiUrl").value.trim() || 'http://localhost:8000';
+        const lang = $("lang").value || 'uz';
+        
+        $("chatStatus").textContent = 'Starting chat...';
+        
+        try {
+          const resp = await fetch(`${apiUrl}/chat/start`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ lang: lang }),
+          });
+
+          if (!resp.ok) {
+            const txt = await resp.text();
+            throw new Error(`HTTP ${resp.status}: ${txt}`);
+          }
+          
+          const data = await resp.json();
+          currentSessionId = data.session_id;
+          
+          // Display greeting
+          $("chatHistory").innerHTML = `<div><strong>Assistant:</strong> ${data.greeting}</div>`;
+          $("chatStatus").textContent = 'Chat started';
+          $("closeChatBtn").disabled = false;
+          setTimeout(() => $("chatStatus").textContent = '', 1500);
+        } catch (err) {
+          $("chatStatus").textContent = 'Error starting chat';
+          console.error('Chat start error:', err);
+        }
+      }
+
+      async function closeChat() {
+        if (!currentSessionId) {
+          $("chatStatus").textContent = 'No active session to close';
+          return;
+        }
+
+        const apiUrl = $("apiUrl").value.trim() || 'http://localhost:8000';
+        $("chatStatus").textContent = 'Closing session...';
+        
+        try {
+          const resp = await fetch(`${apiUrl}/chat/${currentSessionId}/close`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+          });
+
+          if (!resp.ok) {
+            const txt = await resp.text();
+            throw new Error(`HTTP ${resp.status}: ${txt}`);
+          }
+          
+          // Clear session and reset UI
+          currentSessionId = null;
+          $("chatHistory").innerHTML = '';
+          $("closeChatBtn").disabled = true;
+          $("chatStatus").textContent = 'Session closed';
+          setTimeout(() => $("chatStatus").textContent = '', 1500);
+        } catch (err) {
+          $("chatStatus").textContent = 'Error closing session';
+          console.error('Close session error:', err);
+        }
+      }
+
       async function ask() {
-        const apiUrl = $("apiUrl").value.trim() || 'http://localhost:11435/ask';
-        const payload = {
-          query: $("query").value.trim(),
-          k: Math.max(1, parseInt($("k").value, 10) || 3),
-        };
-        const lang = $("lang").value.trim();
-        if (lang) payload.lang = lang;
+        const apiUrl = $("apiUrl").value.trim() || 'http://localhost:8000';
+        const query = $("query").value.trim();
+        const k = Math.max(1, parseInt($("k").value, 10) || 3);
+        const lang = $("lang").value || 'uz';
 
         $("status").textContent = 'Querying…';
         $("answer").textContent = '';
@@ -133,17 +221,61 @@
         $("count").textContent = '';
 
         try {
-          const resp = await fetch(apiUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
-          });
+          let data;
+          
+          if (currentSessionId) {
+            // Use chat endpoint
+            const payload = {
+              session_id: currentSessionId,
+              message: query,
+              k: k,
+              lang: lang
+            };
+            
+            const resp = await fetch(`${apiUrl}/chat/send`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload),
+            });
 
-          if (!resp.ok) {
-            const txt = await resp.text();
-            throw new Error(`HTTP ${resp.status}: ${txt}`);
+            if (!resp.ok) {
+              if (resp.status === 400) {
+                // Session is closed
+                currentSessionId = null;
+                $("closeChatBtn").disabled = true;
+                $("chatHistory").innerHTML = '<div style="color: #d73a49;"><strong>Session closed:</strong> Please start a new chat to continue.</div>';
+                throw new Error('Session is closed. Please start a new chat.');
+              }
+              const txt = await resp.text();
+              throw new Error(`HTTP ${resp.status}: ${txt}`);
+            }
+            
+            data = await resp.json();
+            
+            // Update chat history
+            updateChatHistory(data.history);
+          } else {
+            // Use regular ask endpoint
+            const payload = {
+              query: query,
+              k: k,
+              lang: lang
+            };
+            
+            const resp = await fetch(`${apiUrl}/ask`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload),
+            });
+
+            if (!resp.ok) {
+              const txt = await resp.text();
+              throw new Error(`HTTP ${resp.status}: ${txt}`);
+            }
+            
+            data = await resp.json();
           }
-          const data = await resp.json();
+          
           render(data);
           $("status").textContent = 'Done';
           setTimeout(() => $("status").textContent = '', 1500);
@@ -151,6 +283,20 @@
           $("status").textContent = 'Error';
           $("answer").textContent = String(err);
         }
+      }
+
+      function updateChatHistory(history) {
+        const chatDiv = $("chatHistory");
+        chatDiv.innerHTML = '';
+        
+        history.forEach(msg => {
+          const div = document.createElement('div');
+          div.innerHTML = `<strong>${msg.role === 'user' ? 'You' : 'Assistant'}:</strong> ${msg.content}`;
+          chatDiv.appendChild(div);
+        });
+        
+        // Scroll to bottom
+        chatDiv.scrollTop = chatDiv.scrollHeight;
       }
 
       function render(data) {
