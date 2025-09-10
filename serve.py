@@ -498,6 +498,8 @@ def health() -> Dict[str, str]:
 def chat_start(req: ChatStartRequest) -> ChatStartResponse:
     sid = _db_create_session()
     greeting = get_greeting_message(req.lang)
+    # Save greeting message to database
+    _db_add_message(sid, "assistant", greeting)
     return ChatStartResponse(session_id=sid, greeting=greeting)
 
 
@@ -570,13 +572,15 @@ async def chat_send(req: ChatSendRequest) -> ChatSendResponse:
         if session_status == "closed":
             raise HTTPException(status_code=400, detail="Session is closed. Please start a new chat.")
     
-    history = await anyio.to_thread.run_sync(_db_get_history, sid, 100)
-
     # Append user message to history
     user_text = req.message.strip()
     if not user_text:
         raise HTTPException(status_code=422, detail="Empty message")
+    # Add user message to database immediately
     await anyio.to_thread.run_sync(_db_add_message, sid, "user", user_text)
+    
+    # Get updated history including the user message
+    history = await anyio.to_thread.run_sync(_db_get_history, sid, 100)
 
     # Language & policy
     query_lang = req.lang or detect_query_language(user_text)
