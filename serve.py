@@ -2,7 +2,7 @@ import os
 import json
 import re
 import uuid
-from typing import List, Optional, Dict, Any, Literal
+from typing import List, Optional, Dict, Any, Literal, Generic, TypeVar, Union
 
 import faiss  # type: ignore
 import numpy as np
@@ -15,6 +15,34 @@ from sentence_transformers import SentenceTransformer
 import httpx
 from fastapi.middleware.cors import CORSMiddleware
 
+
+# -------- Envelope Models ---------
+T = TypeVar('T')
+
+class PaginationMeta(BaseModel):
+    page: int
+    page_size: int
+    total: int
+
+class MetaInfo(BaseModel):
+    pagination: Optional[PaginationMeta] = None
+
+class ErrorInfo(BaseModel):
+    code: str
+    message: str
+    details: Optional[Union[Dict[str, Any], List[Any]]] = None
+
+class SuccessEnvelope(BaseModel, Generic[T]):
+    data: T
+    error: None = None
+    meta: Optional[MetaInfo] = None
+    trace_id: str
+
+class ErrorEnvelope(BaseModel):
+    data: None = None
+    error: ErrorInfo
+    meta: None = None
+    trace_id: str
 
 # -------- Config ---------
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "http://localhost:8000/v1")
@@ -216,6 +244,26 @@ def get_greeting_message(lang: str) -> str:
     return greetings.get(lang, greetings["uz"])  # Default to Uzbek
 
 
+# -------- Response Wrappers ---------
+def create_success_response(data: Any, meta: Optional[MetaInfo] = None) -> JSONResponse:
+    """Create a standardized success response."""
+    trace_id = str(uuid.uuid4())
+    envelope = SuccessEnvelope(data=data, meta=meta, trace_id=trace_id)
+    return JSONResponse(content=envelope.model_dump(), status_code=200)
+
+def create_error_response(
+    code: str, 
+    message: str, 
+    details: Optional[Union[Dict[str, Any], List[Any]]] = None,
+    status_code: int = 500
+) -> JSONResponse:
+    """Create a standardized error response."""
+    trace_id = str(uuid.uuid4())
+    error_info = ErrorInfo(code=code, message=message, details=details)
+    envelope = ErrorEnvelope(error=error_info, trace_id=trace_id)
+    return JSONResponse(content=envelope.model_dump(), status_code=status_code)
+
+
 def l2_normalize(x: np.ndarray) -> np.ndarray:
     norms = np.linalg.norm(x, axis=1, keepdims=True) + 1e-12
     return x / norms
@@ -359,11 +407,14 @@ def _on_startup() -> None:
     "/ask",
     tags=["RAG"],
     summary="Ask a question with RAG",
-    response_model=AskResponse,
 )
 async def ask(req: AskRequest):
     if _faiss_index is None or not _metas:
-        raise HTTPException(status_code=500, detail="RAG store not loaded")
+        return create_error_response(
+            code="RAG_STORE_NOT_LOADED",
+            message="RAG store not loaded",
+            status_code=500
+        )
 
     query_lang = req.lang or detect_query_language(req.query)
     is_ru = (query_lang == "ru")
@@ -433,12 +484,25 @@ async def ask(req: AskRequest):
                 json=body,
             )
             if resp.status_code == 422:
-                return JSONResponse(status_code=422, content={"detail": "Invalid request to chat endpoint"})
+                return create_error_response(
+                    code="INVALID_REQUEST",
+                    message="Invalid request to chat endpoint",
+                    status_code=422
+                )
             if resp.status_code >= 400:
-                return JSONResponse(status_code=500, content={"detail": f"Upstream error: {resp.status_code}"})
+                return create_error_response(
+                    code="UPSTREAM_ERROR",
+                    message=f"Upstream error: {resp.status_code}",
+                    status_code=500
+                )
             data = resp.json()
     except Exception as e:
-        return JSONResponse(status_code=500, content={"detail": f"Upstream exception: {str(e)}"})
+        return create_error_response(
+            code="UPSTREAM_EXCEPTION",
+            message=f"Upstream exception: {str(e)}",
+            details={"exception_type": type(e).__name__},
+            status_code=500
+        )
 
     try:
         answer = data["choices"][0]["message"]["content"].strip()
@@ -478,12 +542,13 @@ async def ask(req: AskRequest):
                 "Limitni qanday o‘zgartiraman?",
             ]
 
-    return AskResponse(answer=answer or "", retrieved=typed_items, suggestions=suggestions)
+    response_data = AskResponse(answer=answer or "", retrieved=typed_items, suggestions=suggestions)
+    return create_success_response(response_data.model_dump())
 
 
 @app.get("/health", tags=["Health"], summary="Health check")
-def health() -> Dict[str, str]:
-    return {"status": "ok"}
+def health():
+    return create_success_response({"status": "ok"})
 
 
 # ------------- Chat Endpoints -------------
@@ -493,14 +558,14 @@ def health() -> Dict[str, str]:
     tags=["Chat"],
     summary="Start a new chat session",
     description="Creates and returns a new session_id with a greeting message in the specified language. You can also omit session_id in POST /chat/send to auto-create one.",
-    response_model=ChatStartResponse,
 )
-def chat_start(req: ChatStartRequest) -> ChatStartResponse:
+def chat_start(req: ChatStartRequest):
     sid = _db_create_session()
     greeting = get_greeting_message(req.lang)
     # Save greeting message to database
     _db_add_message(sid, "assistant", greeting)
-    return ChatStartResponse(session_id=sid, greeting=greeting)
+    response_data = ChatStartResponse(session_id=sid, greeting=greeting)
+    return create_success_response(response_data.model_dump())
 
 
 @app.post(
@@ -508,7 +573,6 @@ def chat_start(req: ChatStartRequest) -> ChatStartResponse:
     tags=["Chat"],
     summary="Send a message (creates session if missing)",
     description="Sends a user message, performs RAG on the latest turn, and returns the assistant reply. If session_id is not provided, a new session is created and included in the response.",
-    response_model=ChatSendResponse,
     openapi_extra={
         "requestBody": {
             "content": {
@@ -557,9 +621,13 @@ def chat_start(req: ChatStartRequest) -> ChatStartResponse:
         }
     },
 )
-async def chat_send(req: ChatSendRequest) -> ChatSendResponse:
+async def chat_send(req: ChatSendRequest):
     if _faiss_index is None or not _metas:
-        raise HTTPException(status_code=500, detail="RAG store not loaded")
+        return create_error_response(
+            code="RAG_STORE_NOT_LOADED",
+            message="RAG store not loaded",
+            status_code=500
+        )
 
     # Create or retrieve session
     sid = req.session_id or await anyio.to_thread.run_sync(_db_create_session)
@@ -568,14 +636,26 @@ async def chat_send(req: ChatSendRequest) -> ChatSendResponse:
     if req.session_id:
         session_status = await anyio.to_thread.run_sync(_db_get_session_status, sid)
         if not session_status:
-            raise HTTPException(status_code=404, detail="Session not found")
+            return create_error_response(
+                code="SESSION_NOT_FOUND",
+                message="Session not found",
+                status_code=404
+            )
         if session_status == "closed":
-            raise HTTPException(status_code=400, detail="Session is closed. Please start a new chat.")
+            return create_error_response(
+                code="SESSION_CLOSED",
+                message="Session is closed. Please start a new chat.",
+                status_code=400
+            )
     
     # Append user message to history
     user_text = req.message.strip()
     if not user_text:
-        raise HTTPException(status_code=422, detail="Empty message")
+        return create_error_response(
+            code="EMPTY_MESSAGE",
+            message="Empty message",
+            status_code=422
+        )
     # Add user message to database immediately
     await anyio.to_thread.run_sync(_db_add_message, sid, "user", user_text)
     
@@ -656,12 +736,25 @@ async def chat_send(req: ChatSendRequest) -> ChatSendResponse:
                 json=body,
             )
             if resp.status_code == 422:
-                return JSONResponse(status_code=422, content={"detail": "Invalid request to chat endpoint"})
+                return create_error_response(
+                    code="INVALID_REQUEST",
+                    message="Invalid request to chat endpoint",
+                    status_code=422
+                )
             if resp.status_code >= 400:
-                return JSONResponse(status_code=500, content={"detail": f"Upstream error: {resp.status_code}"})
+                return create_error_response(
+                    code="UPSTREAM_ERROR",
+                    message=f"Upstream error: {resp.status_code}",
+                    status_code=500
+                )
             data = resp.json()
     except Exception as e:
-        return JSONResponse(status_code=500, content={"detail": f"Upstream exception: {str(e)}"})
+        return create_error_response(
+            code="UPSTREAM_EXCEPTION",
+            message=f"Upstream exception: {str(e)}",
+            details={"exception_type": type(e).__name__},
+            status_code=500
+        )
 
     try:
         answer = data["choices"][0]["message"]["content"].strip()
@@ -694,37 +787,47 @@ async def chat_send(req: ChatSendRequest) -> ChatSendResponse:
         ) for it in retrieved_items[:k]
     ]
 
-    return ChatSendResponse(
+    response_data = ChatSendResponse(
         session_id=sid,
         answer=answer or "",
         retrieved=typed_items,
         suggestions=suggestions,
         history=[ChatMessage(**m) for m in (history + [{"role": "assistant", "content": answer}])[-20:]],
     )
+    return create_success_response(response_data.model_dump())
 
 
-@app.get("/chat/{session_id}/history", tags=["Chat"], summary="Get chat history", response_model=ChatHistoryResponse)
-def chat_history(session_id: str) -> ChatHistoryResponse:
+@app.get("/chat/{session_id}/history", tags=["Chat"], summary="Get chat history")
+def chat_history(session_id: str):
     hist = _db_get_history(session_id, 200)
-    return ChatHistoryResponse(session_id=session_id, history=[ChatMessage(**m) for m in hist[-50:]])
+    response_data = ChatHistoryResponse(session_id=session_id, history=[ChatMessage(**m) for m in hist[-50:]])
+    return create_success_response(response_data.model_dump())
 
 
 @app.post("/chat/{session_id}/close", tags=["Chat"], summary="Close chat session")
-def chat_close(session_id: str) -> Dict[str, str]:
+def chat_close(session_id: str):
     session_status = _db_get_session_status(session_id)
     if not session_status:
-        raise HTTPException(status_code=404, detail="Session not found")
+        return create_error_response(
+            code="SESSION_NOT_FOUND",
+            message="Session not found",
+            status_code=404
+        )
     if session_status == "closed":
-        raise HTTPException(status_code=400, detail="Session already closed")
+        return create_error_response(
+            code="SESSION_ALREADY_CLOSED",
+            message="Session already closed",
+            status_code=400
+        )
     
     _db_close_session(session_id)
-    return {"status": "closed", "session_id": session_id}
+    return create_success_response({"status": "closed", "session_id": session_id})
 
 
 @app.delete("/chat/{session_id}", tags=["Chat"], summary="Reset chat session")
-def chat_reset(session_id: str) -> Dict[str, str]:
+def chat_reset(session_id: str):
     _db_clear_session(session_id)
-    return {"status": "cleared", "session_id": session_id}
+    return create_success_response({"status": "cleared", "session_id": session_id})
 
 
 # ------------- Export Endpoints -------------
