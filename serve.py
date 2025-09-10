@@ -102,6 +102,7 @@ sessions_table = Table(
     "sessions",
     metadata,
     Column("id", String(64), primary_key=True),
+    Column("user_id", String(64), nullable=False, index=True),
     Column("created_at", DateTime, server_default=func.now(), nullable=False),
     Column("status", String(16), nullable=False, default="active"),
 )
@@ -138,27 +139,33 @@ def load_store() -> None:
 # --- DB helpers (run in thread to avoid blocking async loop) ---
 def _db_create_tables() -> None:
     metadata.create_all(engine)
-    # Add status column if it doesn't exist (for existing databases)
+    # Add status and user_id columns if they don't exist (for existing databases)
     try:
         with engine.begin() as conn:
             # Check if status column exists first
             result = conn.execute(text("SHOW COLUMNS FROM sessions LIKE 'status'")).fetchone()
             if not result:
                 conn.execute(text("ALTER TABLE sessions ADD COLUMN status VARCHAR(16) DEFAULT 'active'"))
+            
+            # Check if user_id column exists
+            result = conn.execute(text("SHOW COLUMNS FROM sessions LIKE 'user_id'")).fetchone()
+            if not result:
+                conn.execute(text("ALTER TABLE sessions ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT 'anonymous'"))
+                conn.execute(text("ALTER TABLE sessions ADD INDEX idx_user_id (user_id)"))
     except Exception:
         # Column already exists or other error, ignore
         pass
 
 
-def _db_create_session() -> str:
+def _db_create_session(user_id: str = "anonymous") -> str:
     sid = uuid.uuid4().hex
     with engine.begin() as conn:
         try:
-            # Try with status column first
-            conn.execute(insert(sessions_table).values(id=sid, status="active"))
+            # Try with all columns first
+            conn.execute(insert(sessions_table).values(id=sid, user_id=user_id, status="active"))
         except Exception:
-            # Fallback for databases without status column - use raw SQL
-            conn.execute(text(f"INSERT INTO sessions (id) VALUES ('{sid}')"))
+            # Fallback for databases without new columns - use raw SQL
+            conn.execute(text(f"INSERT INTO sessions (id, user_id) VALUES ('{sid}', '{user_id}')"))
     return sid
 
 
@@ -211,6 +218,41 @@ def _db_get_session_status(session_id: str) -> Optional[str]:
             # Fallback: check if session exists (assume active if it does) - use raw SQL
             result = conn.execute(text(f"SELECT id FROM sessions WHERE id = '{session_id}'")).first()
             return "active" if result else None
+
+
+def _db_get_sessions_by_user(user_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+    with engine.begin() as conn:
+        try:
+            # Try to get sessions with all columns
+            result = conn.execute(
+                select(sessions_table.c.id, sessions_table.c.user_id, sessions_table.c.created_at, sessions_table.c.status)
+                .where(sessions_table.c.user_id == user_id)
+                .order_by(sessions_table.c.created_at.desc())
+                .limit(limit)
+            ).all()
+            return [
+                {
+                    "id": r.id,
+                    "user_id": r.user_id,
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                    "status": r.status
+                }
+                for r in result
+            ]
+        except Exception:
+            # Fallback: use raw SQL
+            result = conn.execute(
+                text(f"SELECT id, user_id, created_at, status FROM sessions WHERE user_id = '{user_id}' ORDER BY created_at DESC LIMIT {limit}")
+            ).all()
+            return [
+                {
+                    "id": r[0],
+                    "user_id": r[1],
+                    "created_at": r[2].isoformat() if r[2] else None,
+                    "status": r[3] if len(r) > 3 else "active"
+                }
+                for r in result
+            ]
 
 
 def detect_query_language(text: str) -> str:
@@ -354,6 +396,7 @@ class AskResponse(BaseModel):
 
 class ChatStartRequest(BaseModel):
     lang: str = Field(default="uz", description="Language code: uz, ru, or en")
+    user_id: str = Field(description="User identifier")
 
 
 class ChatStartResponse(BaseModel):
@@ -560,7 +603,7 @@ def health():
     description="Creates and returns a new session_id with a greeting message in the specified language. You can also omit session_id in POST /chat/send to auto-create one.",
 )
 def chat_start(req: ChatStartRequest):
-    sid = _db_create_session()
+    sid = _db_create_session(req.user_id)
     greeting = get_greeting_message(req.lang)
     # Save greeting message to database
     _db_add_message(sid, "assistant", greeting)
@@ -828,6 +871,15 @@ def chat_close(session_id: str):
 def chat_reset(session_id: str):
     _db_clear_session(session_id)
     return create_success_response({"status": "cleared", "session_id": session_id})
+
+
+@app.get("/chat/sessions", tags=["Chat"], summary="Get sessions by user_id")
+def get_sessions(
+    user_id: str = Query(description="User identifier"),
+    limit: int = Query(default=50, ge=1, le=100, description="Maximum number of sessions to return")
+):
+    sessions = _db_get_sessions_by_user(user_id, limit)
+    return create_success_response(sessions)
 
 
 # ------------- Export Endpoints -------------
