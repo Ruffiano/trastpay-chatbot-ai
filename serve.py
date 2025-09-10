@@ -9,7 +9,7 @@ import numpy as np
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import create_engine, MetaData, Table, Column, String, Text, Integer, DateTime, func, select, delete, insert
+from sqlalchemy import create_engine, MetaData, Table, Column, String, Text, Integer, DateTime, func, select, delete, insert, text
 import anyio
 from sentence_transformers import SentenceTransformer
 import httpx
@@ -113,7 +113,10 @@ def _db_create_tables() -> None:
     # Add status column if it doesn't exist (for existing databases)
     try:
         with engine.begin() as conn:
-            conn.execute("ALTER TABLE sessions ADD COLUMN status VARCHAR(16) DEFAULT 'active'")
+            # Check if status column exists first
+            result = conn.execute(text("SHOW COLUMNS FROM sessions LIKE 'status'")).fetchone()
+            if not result:
+                conn.execute(text("ALTER TABLE sessions ADD COLUMN status VARCHAR(16) DEFAULT 'active'"))
     except Exception:
         # Column already exists or other error, ignore
         pass
@@ -126,8 +129,8 @@ def _db_create_session() -> str:
             # Try with status column first
             conn.execute(insert(sessions_table).values(id=sid, status="active"))
         except Exception:
-            # Fallback for databases without status column
-            conn.execute(insert(sessions_table).values(id=sid))
+            # Fallback for databases without status column - use raw SQL
+            conn.execute(text(f"INSERT INTO sessions (id) VALUES ('{sid}')"))
     return sid
 
 
@@ -163,8 +166,8 @@ def _db_close_session(session_id: str) -> None:
                 .values(status="closed")
             )
         except Exception:
-            # Fallback: delete the session if status column doesn't exist
-            conn.execute(delete(sessions_table).where(sessions_table.c.id == session_id))
+            # Fallback: delete the session if status column doesn't exist - use raw SQL
+            conn.execute(text(f"DELETE FROM sessions WHERE id = '{session_id}'"))
 
 
 def _db_get_session_status(session_id: str) -> Optional[str]:
@@ -177,11 +180,8 @@ def _db_get_session_status(session_id: str) -> Optional[str]:
             ).first()
             return result.status if result else None
         except Exception:
-            # Fallback: check if session exists (assume active if it does)
-            result = conn.execute(
-                select(sessions_table.c.id)
-                .where(sessions_table.c.id == session_id)
-            ).first()
+            # Fallback: check if session exists (assume active if it does) - use raw SQL
+            result = conn.execute(text(f"SELECT id FROM sessions WHERE id = '{session_id}'")).first()
             return "active" if result else None
 
 
