@@ -427,6 +427,7 @@ class ChatSendRequest(BaseModel):
 
 class ChatHistoryResponse(BaseModel):
     session_id: str
+    status: str
     history: List[ChatMessage]
 
 
@@ -843,7 +844,19 @@ async def chat_send(req: ChatSendRequest):
 @app.get("/chat/{session_id}/history", tags=["Chat"], summary="Get chat history")
 def chat_history(session_id: str):
     hist = _db_get_history(session_id, 200)
-    response_data = ChatHistoryResponse(session_id=session_id, history=[ChatMessage(**m) for m in hist[-50:]])
+    session_status = _db_get_session_status(session_id)
+    if not session_status:
+        return create_error_response(
+            code="SESSION_NOT_FOUND",
+            message="Session not found",
+            status_code=404
+        )
+    
+    response_data = ChatHistoryResponse(
+        session_id=session_id, 
+        status=session_status,
+        history=[ChatMessage(**m) for m in hist[-50:]]
+    )
     return create_success_response(response_data.model_dump())
 
 
