@@ -21,6 +21,8 @@ def detect_lang_heuristic(text: str) -> str:
     return "uz_lat_or_other"
 
 
+
+
 def l2_normalize(x: np.ndarray) -> np.ndarray:
     norms = np.linalg.norm(x, axis=1, keepdims=True) + 1e-12
     return x / norms
