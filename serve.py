@@ -103,6 +103,7 @@ sessions_table = Table(
     metadata,
     Column("id", String(64), primary_key=True),
     Column("user_id", String(64), nullable=False, index=True),
+    Column("title", String(255), nullable=True),
     Column("created_at", DateTime, server_default=func.now(), nullable=False),
     Column("status", String(16), nullable=False, default="active"),
 )
@@ -139,7 +140,7 @@ def load_store() -> None:
 # --- DB helpers (run in thread to avoid blocking async loop) ---
 def _db_create_tables() -> None:
     metadata.create_all(engine)
-    # Add status and user_id columns if they don't exist (for existing databases)
+    # Add status, user_id, and title columns if they don't exist (for existing databases)
     try:
         with engine.begin() as conn:
             # Check if status column exists first
@@ -152,6 +153,11 @@ def _db_create_tables() -> None:
             if not result:
                 conn.execute(text("ALTER TABLE sessions ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT 'anonymous'"))
                 conn.execute(text("ALTER TABLE sessions ADD INDEX idx_user_id (user_id)"))
+            
+            # Check if title column exists
+            result = conn.execute(text("SHOW COLUMNS FROM sessions LIKE 'title'")).fetchone()
+            if not result:
+                conn.execute(text("ALTER TABLE sessions ADD COLUMN title VARCHAR(255) NULL"))
     except Exception:
         # Column already exists or other error, ignore
         pass
@@ -220,12 +226,26 @@ def _db_get_session_status(session_id: str) -> Optional[str]:
             return "active" if result else None
 
 
+def _db_update_session_title(session_id: str, title: str) -> None:
+    with engine.begin() as conn:
+        try:
+            # Try to update title column
+            conn.execute(
+                sessions_table.update()
+                .where(sessions_table.c.id == session_id)
+                .values(title=title)
+            )
+        except Exception:
+            # Fallback: use raw SQL
+            conn.execute(text(f"UPDATE sessions SET title = '{title}' WHERE id = '{session_id}'"))
+
+
 def _db_get_sessions_by_user(user_id: str, limit: int = 50) -> List[Dict[str, Any]]:
     with engine.begin() as conn:
         try:
             # Try to get sessions with all columns
             result = conn.execute(
-                select(sessions_table.c.id, sessions_table.c.user_id, sessions_table.c.created_at, sessions_table.c.status)
+                select(sessions_table.c.id, sessions_table.c.user_id, sessions_table.c.title, sessions_table.c.created_at, sessions_table.c.status)
                 .where(sessions_table.c.user_id == user_id)
                 .order_by(sessions_table.c.created_at.desc())
                 .limit(limit)
@@ -234,6 +254,7 @@ def _db_get_sessions_by_user(user_id: str, limit: int = 50) -> List[Dict[str, An
                 {
                     "id": r.id,
                     "user_id": r.user_id,
+                    "title": r.title if r.title else None,
                     "created_at": r.created_at.isoformat() if r.created_at else None,
                     "status": r.status
                 }
@@ -242,14 +263,15 @@ def _db_get_sessions_by_user(user_id: str, limit: int = 50) -> List[Dict[str, An
         except Exception:
             # Fallback: use raw SQL
             result = conn.execute(
-                text(f"SELECT id, user_id, created_at, status FROM sessions WHERE user_id = '{user_id}' ORDER BY created_at DESC LIMIT {limit}")
+                text(f"SELECT id, user_id, title, created_at, status FROM sessions WHERE user_id = '{user_id}' ORDER BY created_at DESC LIMIT {limit}")
             ).all()
             return [
                 {
                     "id": r[0],
                     "user_id": r[1],
-                    "created_at": r[2].isoformat() if r[2] else None,
-                    "status": r[3] if len(r) > 3 else "active"
+                    "title": r[2] if len(r) > 2 and r[2] else None,
+                    "created_at": r[3].isoformat() if len(r) > 3 and r[3] else None,
+                    "status": r[4] if len(r) > 4 else "active"
                 }
                 for r in result
             ]
@@ -284,6 +306,60 @@ def get_greeting_message(lang: str) -> str:
         "en": "Hello! I'm your Trastpay assistant. How can I assist you today?"
     }
     return greetings.get(lang, greetings["uz"])  # Default to Uzbek
+
+
+async def generate_chat_title(history: List[Dict[str, str]], lang: str = "uz") -> str:
+    """Generate a title for the chat based on the conversation history."""
+    if not history or len(history) < 2:
+        return "New Chat"
+    
+    # Get the first few user messages (skip greeting)
+    user_messages = []
+    for msg in history[1:]:  # Skip greeting
+        if msg.get("role") == "user":
+            user_messages.append(msg.get("content", ""))
+        if len(user_messages) >= 3:  # Limit to first 3 user messages
+            break
+    
+    if not user_messages:
+        return "New Chat"
+    
+    # Create a prompt for title generation
+    if lang == "ru":
+        prompt = f"Создай краткий заголовок (максимум 5 слов) для этого разговора на основе первых сообщений пользователя: {' '.join(user_messages[:2])}"
+    elif lang == "en":
+        prompt = f"Create a brief title (maximum 5 words) for this conversation based on the user's first messages: {' '.join(user_messages[:2])}"
+    else:  # uz
+        prompt = f"Ushbu suhbat uchun qisqa sarlavha yarating (maksimal 5 so'z) foydalanuvchining birinchi xabarlariga asosan: {' '.join(user_messages[:2])}"
+    
+    try:
+        headers = {"Content-Type": "application/json"}
+        if OPENAI_API_KEY:
+            headers["Authorization"] = f"Bearer {OPENAI_API_KEY}"
+        
+        body = {
+            "model": OPENAI_MODEL,
+            "temperature": 0.3,
+            "max_tokens": 20,
+            "messages": [{"role": "user", "content": prompt}]
+        }
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                f"{OPENAI_BASE_URL.rstrip('/')}/chat/completions",
+                headers=headers,
+                json=body,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                title = data["choices"][0]["message"]["content"].strip().strip('"\'')
+                return title[:100]  # Limit title length
+    except Exception:
+        pass
+    
+    # Fallback: use first user message truncated
+    first_message = user_messages[0]
+    return first_message[:50] + "..." if len(first_message) > 50 else first_message
 
 
 # -------- Response Wrappers ---------
@@ -807,6 +883,15 @@ async def chat_send(req: ChatSendRequest):
 
     # Append assistant message to history
     await anyio.to_thread.run_sync(_db_add_message, sid, "assistant", answer)
+    
+    # Generate title after 2-3 exchanges (when we have enough conversation)
+    updated_history = await anyio.to_thread.run_sync(_db_get_history, sid, 10)
+    if len(updated_history) >= 4 and len(updated_history) <= 6:  # 2-3 exchanges
+        try:
+            title = await generate_chat_title(updated_history, query_lang)
+            await anyio.to_thread.run_sync(_db_update_session_title, sid, title)
+        except Exception:
+            pass  # Don't fail if title generation fails
 
     # Suggestions (reuse logic)
     suggestions: List[str] = []
@@ -893,6 +978,50 @@ def get_sessions(
 ):
     sessions = _db_get_sessions_by_user(user_id, limit)
     return create_success_response(sessions)
+
+
+@app.post("/chat/{session_id}/generate-title", tags=["Chat"], summary="Generate title for existing session")
+async def generate_session_title(session_id: str):
+    # Check if session exists
+    session_status = _db_get_session_status(session_id)
+    if not session_status:
+        return create_error_response(
+            code="SESSION_NOT_FOUND",
+            message="Session not found",
+            status_code=404
+        )
+    
+    # Get session history
+    history = _db_get_history(session_id, 10)
+    if not history or len(history) < 2:
+        return create_error_response(
+            code="INSUFFICIENT_HISTORY",
+            message="Not enough conversation history to generate title",
+            status_code=400
+        )
+    
+    # Detect language from first user message
+    user_messages = [msg for msg in history if msg.get("role") == "user"]
+    if not user_messages:
+        return create_error_response(
+            code="NO_USER_MESSAGES",
+            message="No user messages found in session",
+            status_code=400
+        )
+    
+    lang = detect_query_language(user_messages[0].get("content", ""))
+    
+    # Generate title
+    try:
+        title = await generate_chat_title(history, lang)
+        _db_update_session_title(session_id, title)
+        return create_success_response({"title": title})
+    except Exception as e:
+        return create_error_response(
+            code="TITLE_GENERATION_FAILED",
+            message=f"Failed to generate title: {str(e)}",
+            status_code=500
+        )
 
 
 # ------------- Export Endpoints -------------
